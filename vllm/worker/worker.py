@@ -13,6 +13,8 @@ from vllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory
 
+import time
+
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -246,7 +248,7 @@ class Worker:
         blocks_to_swap_in: Dict[int, int],
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
-    ) -> Dict[int, SequenceOutputs]:
+    ) -> Tuple[Dict[int, SequenceOutputs], List[float]]:
         # Issue cache operations.
         issued_cache_op = False
         if blocks_to_swap_in:
@@ -276,6 +278,10 @@ class Worker:
             seq_group_metadata_list)
 
         # Execute the model.
+        execute_time = [0.0, 0.0]
+        start_time = time.perf_counter()
+        is_all_prefill = all([s.is_prompt for s in seq_group_metadata_list])
+        is_all_decode = all([not s.is_prompt for s in seq_group_metadata_list])
         output = self.model(
             input_ids=input_tokens,
             positions=input_positions,
@@ -283,7 +289,15 @@ class Worker:
             input_metadata=input_metadata,
             cache_events=cache_events,
         )
-        return output
+        end_time = time.perf_counter()
+        time_elapsed = end_time - start_time
+        if is_all_prefill:
+            execute_time[0] += time_elapsed
+        elif is_all_decode:
+            execute_time[1] += time_elapsed
+        else:
+            print("This step have both prefill and decode")
+        return output, execute_time
 
 
 def _init_distributed_environment(
@@ -310,3 +324,4 @@ def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:
     return x + [0] * (max_len - len(x))
+

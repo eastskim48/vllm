@@ -17,7 +17,9 @@ def get_tokenizer(
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
     config = AutoConfig.from_pretrained(model_name)
-    if "open_llama" in model_name:
+    if model_name.startswith("meta-llama/"):
+        return AutoTokenizer.from_pretrained(model_name, padding_side="left", use_fast=True)
+    elif "open_llama" in model_name:
         kwargs["use_fast"] = False
         logger.info(
             "OpenLLaMA models do not support the fast tokenizer. "
@@ -90,3 +92,4 @@ def detokenize_incrementally(
         sub_texts.append(sub_text)
     output_text = " ".join(sub_texts)
     return new_token, output_text
+

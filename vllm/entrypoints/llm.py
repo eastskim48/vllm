@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -66,7 +66,7 @@ class LLM:
         sampling_params: Optional[SamplingParams] = None,
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
-    ) -> List[RequestOutput]:
+    ) -> Tuple[List[RequestOutput], float]:
         """Generates the completions for the input prompts.
 
         NOTE: This class automatically batches the given prompts, considering
@@ -123,15 +123,19 @@ class LLM:
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
 
-    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
+    def _run_engine(self, use_tqdm: bool) -> Tuple[List[RequestOutput], List[float]]:
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
             pbar = tqdm(total=num_requests, desc="Processed prompts")
         # Run the engine.
         outputs: List[RequestOutput] = []
+        total_time = [0.0, 0.0]
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs, execute_time = self.llm_engine.step()
+            if execute_time[0] > 0 or execute_time[1] > 0:
+                total_time[0] += execute_time[0]
+                total_time[1] += execute_time[1]
             for output in step_outputs:
                 if output.finished():
                     outputs.append(output)
@@ -139,4 +143,5 @@ class LLM:
                         pbar.update(1)
         if use_tqdm:
             pbar.close()
-        return outputs
+        return outputs, total_time
+
