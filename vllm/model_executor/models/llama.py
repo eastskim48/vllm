@@ -43,6 +43,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.model_executor.parallel_utils.tensor_parallel import (
     VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
 from vllm.sequence import SequenceOutputs
+import bitsandbytes as bnb
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -56,21 +57,33 @@ class LlamaMLP(nn.Module):
         hidden_act: str,
     ):
         super().__init__()
+        """
         self.gate_up_proj = ColumnParallelLinear(hidden_size, 2 * intermediate_size,
                                                  bias=False, gather_output=False,
                                                  perform_initialization=False)
         self.down_proj = RowParallelLinear(intermediate_size, hidden_size,
                                            bias=False, input_is_parallel=True,
                                            perform_initialization=False)
+        """
+        self.gate_up_proj = bnb.nn.Linear4bit(hidden_size, intermediate_size,bias=False,
+                                quant_type="nf4",  # bnb_4bit_quant_type
+                                compute_dtype=torch.float16,  # bnb_4bit_compute_dtype
+                                compress_statistics=True,  # bnb_4bit_use_double_quant
+                            )
+        self.down_proj = bnb.nn.Linear4bit(intermediate_size, hidden_size, bias=False,
+                            quant_type = "nf4",  # bnb_4bit_quant_type
+                            compute_dtype = torch.float16,  # bnb_4bit_compute_dtype
+                            compress_statistics = True,  # bnb_4bit_use_double_quant
+                        )
         if hidden_act != 'silu':
             raise ValueError(f'Unsupported activation: {hidden_act}. '
                              'Only silu is supported for now.')
-        self.act_fn = SiluAndMul()
+        self.act_fn = torch.nn.SiLU()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x = self.down_proj(x)
         return x
 
 
@@ -90,6 +103,7 @@ class LlamaAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.scaling = self.head_dim ** -0.5
 
+        """
         self.qkv_proj = ColumnParallelLinear(
             hidden_size,
             3 * self.total_num_heads * self.head_dim,
@@ -104,6 +118,17 @@ class LlamaAttention(nn.Module):
             input_is_parallel=True,
             perform_initialization=False,
         )
+        """
+        self.qkv_proj = bnb.nn.Linear4bit(hidden_size, 3 * self.total_num_heads * self.head_dim, bias=False,
+                                quant_type="nf4",  # bnb_4bit_quant_type
+                                compute_dtype=torch.float16,  # bnb_4bit_compute_dtype
+                                compress_statistics=True,  # bnb_4bit_use_double_quant
+                            )
+        self.o_proj = bnb.nn.Linear4bit(self.total_num_heads * self.head_dim, hidden_size, bias=False,
+                                          quant_type="nf4",  # bnb_4bit_quant_type
+                                          compute_dtype=torch.float16,  # bnb_4bit_compute_dtype
+                                          compress_statistics=True,  # bnb_4bit_use_double_quant
+                                          )
         self.attn = PagedAttentionWithRoPE(self.num_heads, self.head_dim,
                                            self.scaling, rotary_dim=self.head_dim)
 
@@ -115,12 +140,12 @@ class LlamaAttention(nn.Module):
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         k_cache, v_cache = kv_cache
         attn_output = self.attn(
             positions, q, k, v, k_cache, v_cache, input_metadata, cache_event)
-        output, _ = self.o_proj(attn_output)
+        output = self.o_proj(attn_output)
         return output
 
 
