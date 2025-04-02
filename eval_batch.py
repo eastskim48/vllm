@@ -69,7 +69,7 @@ class QueryProcessor():
             self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
 
         if is_vllm:
-            self.llm = LLM(model=model_name)
+            self.llm = LLM(model=model_name, gpu_memory_utilization=0.3)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,

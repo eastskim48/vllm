@@ -66,7 +66,7 @@ class LLM:
         sampling_params: Optional[SamplingParams] = None,
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
-    ) -> Tuple[List[RequestOutput], float]:
+    ) -> Tuple[List[RequestOutput], List[float]]:
         """Generates the completions for the input prompts.
 
         NOTE: This class automatically batches the given prompts, considering
