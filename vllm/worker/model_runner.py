@@ -1767,6 +1767,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not bypass_model_exec:
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
+                import time
+                torch.cuda.synchronize()
+                start = time.perf_counter()
                 hidden_or_intermediate_states = model_executable(
                     input_ids=model_input.input_tokens,
                     positions=model_input.input_positions,
@@ -1776,6 +1779,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     **seqlen_agnostic_kwargs,
                     **model_kwargs,
                 )
+                if model_input.is_prompt:
+                    torch.cuda.synchronize()
+                    print(f"prefill time: {time.perf_counter()-start:.6f}")
+                    print(f"block_tables: {model_input.attn_metadata.prefill_metadata.block_tables}")
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
