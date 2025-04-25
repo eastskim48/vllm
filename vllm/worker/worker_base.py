@@ -24,6 +24,7 @@ from vllm.utils import (enable_trace_function_call_for_thread,
 from vllm.worker.model_runner_base import (BroadcastableModelInput,
                                            ModelRunnerBase,
                                            ModelRunnerInputBase)
+from vllm.profiler.utils import TimeEstimator
 
 logger = init_logger(__name__)
 
@@ -417,6 +418,11 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
 
+        te = TimeEstimator(
+            name=str(id(self)),
+            key="prefill" if model_input.is_prompt else "decode"
+        )
+
         output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]
@@ -425,6 +431,12 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             num_steps=num_steps,
             **kwargs,
         )
+
+        te.finish()
+
+        if model_input.is_prompt:
+            num_blocks_used = model_input.attn_metadata.prefill_metadata.block_tables.shape[1]
+            print(f"num of reused blocks: {num_blocks_used}")
 
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:

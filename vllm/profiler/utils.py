@@ -2,6 +2,10 @@
 
 import dataclasses
 from typing import Callable, Dict, List, Type, Union
+import json
+import torch
+import time
+import os
 
 from torch._C._profiler import _EventType, _ProfilerEvent, _TensorMetadata
 
@@ -145,3 +149,39 @@ def event_torch_op_stack_trace(curr_event: _ProfilerEvent,
         curr_event = curr_event.parent
 
     return trace
+
+class TimeEstimator:
+    def __init__(self, name: str, key: str):
+        self.key = key
+        self.name = name
+        self.start_time = 0.0
+        self.elapsed_time = 0.0
+        self._start()
+        self.file_path = os.path.join(
+            os.getenv("MATKV_LOGGING_PATH"), "matkv.json"
+        )
+
+    def _start(self):
+        torch.cuda.synchronize()
+        self.start_time = time.perf_counter()
+
+    def finish(self):
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        self.elapsed_time = end_time - self.start_time
+        self._write()
+
+    def _write(self):
+        if os.path.exists(self.file_path):
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if self.name not in data:
+                data[self.name] = {self.key: []}
+            if self.key not in data[self.name]:
+                data[self.name][self.key] = []
+        else:
+            data = {self.name: {self.key: []}}
+        data[self.name][self.key] = data[self.name][self.key] + [self.elapsed_time]
+
+        with open(self.file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
