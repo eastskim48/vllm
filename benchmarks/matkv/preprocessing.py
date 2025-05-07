@@ -58,7 +58,6 @@ if __name__ == "__main__":
         model_name="meta-llama/Llama-3.2-3B",
         db_dir="/home/s2/dongseob/preprocessing/db_3b",
         doc_dir="/home/s2/dongseob/preprocessing/qa_data/documents",
-        # cache_dir="/home/s2/dongseob/preprocessing/cache_3b",
         cache_dir="./test_caches",
         chunk_size=512,
         max_samples=1

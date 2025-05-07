@@ -21,7 +21,6 @@ class MatKVCache:
         self._load(dir_path, cache_ids)
 
     def _load(self, dir_path: str, cache_ids: List[str]):
-        # TODO: sorting
         chunked_caches = [
             torch.load(
                 os.path.join(dir_path, f"{cache_id}.pt"),
@@ -31,7 +30,6 @@ class MatKVCache:
         assert len(chunked_caches) != 0, "no cache file found"
         num_layers = len(chunked_caches[0])
         for layer_idx in range(num_layers):
-            # TODO: optimize with torch kernel
             # in: (num_heads, num_tokens, head_dim), out: (num_tokens, num_heads, head_dim)
             key_caches = list(map(lambda x: x[layer_idx][0].squeeze(dim=0), chunked_caches))
             value_caches = list(map(lambda x: x[layer_idx][1].squeeze(dim=0), chunked_caches))
@@ -66,6 +64,7 @@ class LLMManager:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.max_token_len = max_token_len
+        self.num_blocks_allocated = 0
 
     def __del__(self):
         del self.llm
@@ -84,7 +83,7 @@ class LLMManager:
         assert len(self.llm.llm_engine.scheduler) == 1, "only support single scheduler (single gpu worker)"
         return self.llm.llm_engine.scheduler[0].block_manager
 
-    def generate(self, prompts: List[str], print_outputs: bool = False) -> List[RequestOutput]:
+    def generate(self, prompts: List[str], print_outputs: bool = True) -> List[RequestOutput]:
         outputs = self.llm.generate(prompts=prompts, sampling_params=self.sampling_params)
         if print_outputs:
             self._print_outputs(outputs)
@@ -115,19 +114,22 @@ class LLMManager:
         self.block_manager.mark_blocks_as_computed(seq_group=seq_group, token_chunk_size=0)
 
     def load_external_cache(self, cache: MatKVCache):
-        # this only add caches to blocks at front
+        # add caches to blocks
         num_blocks = cache.num_tokens // self.block_size
         assert cache.num_tokens % self.block_size == 0, \
             f"num_tokens must be divisible by block_size but num_tokens:{cache.num_tokens}"
 
         for layer_idx, layer_cache in enumerate(cache.layers):
-            for block_idx in range(num_blocks):
-                start_pos = block_idx * self.block_size
+            key_cache_reshaped = layer_cache.key.view(num_blocks, self.block_size, *layer_cache.key.shape[1:])
+            self.kv_cache[layer_idx][0][
+                self.num_blocks_allocated: self.num_blocks_allocated + num_blocks
+            ].copy_(key_cache_reshaped)
 
-                key_cache = layer_cache.key[start_pos:start_pos + self.block_size]
-                value_cache = layer_cache.value[start_pos:start_pos + self.block_size]
-                self.kv_cache[layer_idx][0][block_idx].copy_(key_cache)
-                self.kv_cache[layer_idx][1][block_idx].copy_(value_cache)
+            value_cache_reshaped = layer_cache.value.view(num_blocks, self.block_size, *layer_cache.value.shape[1:])
+            self.kv_cache[layer_idx][1][
+                self.num_blocks_allocated: self.num_blocks_allocated + num_blocks
+            ].copy_(value_cache_reshaped)
+        self.num_blocks_allocated += num_blocks
 
 
 def get_prompt(doc_text: str, query: str) -> str:
@@ -145,14 +147,14 @@ class MatKVLayerCache:
     value: torch.Tensor
 
 
-def analyze_logged_times(key: str, log_path: str) -> Optional[Tuple[float, float]]:
+def analyze_logged_times(key: str, log_path: str) -> Optional[Tuple[float, float, float]]:
     assert os.path.exists(log_path), f"log file not found: {log_path}"
     with open(log_path) as f:
         data = json.load(f).get(key, {})
 
     if len(data.get("prefill", [])) != 1 or data.get("prefill", []) == []:
         return None
-    return sum(data["prefill"]), sum(data["decode"])
+    return sum(data["prefill"]), sum(data["decode"]), len(data["decode"])
 
 
 def main(
@@ -177,6 +179,7 @@ def main(
     load_times = []
     overall_times = []
     search_times = []
+    decode_counts = []
     num_errors = 0
 
     with open(query_path) as f:
@@ -199,25 +202,27 @@ def main(
             search_times.append(search_te.stop())
 
             prompts = []
-            for idx, query in enumerate(batch_queries):
-                cache_ids = sorted(results["ids"][idx])
-                doc_text = "".join(results["documents"][idx])
+            batch_inputs = []
+            for batch_idx, query in enumerate(batch_queries):
+                cache_ids = sorted(results["ids"][batch_idx])
+                doc_text = "".join(results["documents"][batch_idx])
                 prompt = get_prompt(doc_text, query)
                 prompts.append(prompt)
+                batch_inputs.append((cache_ids, doc_text))
 
-                if use_cache:
+            if use_cache:
+                cache_time = 0
+                for cache_ids, doc_text in batch_inputs:
+                    cache_te = TimeEstimator()
                     # load blocks
                     llm.load_block_to_engine(doc_text)
 
                     # load caches
-                    cache_te = TimeEstimator()
-
                     cache = MatKVCache(cache_dir, cache_ids)
                     llm.load_external_cache(cache)
-
-                    load_times.append(cache_te.stop())
-
+                    cache_time += cache_te.stop()
                     del cache
+                load_times.append(cache_time)
 
             # batch run
             engine_te = TimeEstimator()
@@ -228,11 +233,12 @@ def main(
 
             times = analyze_logged_times(str(id(llm.worker)), log_path)
             if times is not None:
-                prefill_time, decode_time = times
+                prefill_time, decode_time, decode_count = times
                 prefill_times.append(prefill_time)
             else:
                 num_errors += 1
             decode_times.append(decode_time)
+            decode_counts.append(decode_count)
 
             del llm
             batch_queries = []
@@ -245,6 +251,8 @@ def main(
     print(f"Avg engine time: {sum(engine_times) / len(engine_times)}")
     print(f"Avg prefill time: {sum(prefill_times) / len(prefill_times)}")
     print(f"Avg decode time: {sum(decode_times) / len(decode_times)}")
+    print(f"Avg generated tokens: {sum(decode_counts) / len(decode_counts)}")
+    print(f"Avg decode time per step: {sum(decode_times) / sum(decode_counts)}")
     print(f"Avg overall time: {sum(overall_times) / len(overall_times)}")
     print(f"Num errors: {num_errors}")
 
@@ -258,7 +266,7 @@ if __name__ == "__main__":
         query_path="/home/s2/dongseob/preprocessing/qa_data/questions/query.jsonl",
         log_path="./profile/matkv.json",
         top_k=2,
-        batch_size=1,
+        batch_size=8,
         block_size=16,
-        max_samples=1,
+        max_samples=64,
     )

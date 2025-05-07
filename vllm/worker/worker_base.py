@@ -417,7 +417,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                     and self.observability_config.collect_model_execute_time):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
-
+        print(f"incoming batch size: {len(model_input.query_lens)}, is_prefill: {model_input.is_prompt}")
         te = TimeEstimator(
             name=str(id(self)),
             key="prefill" if model_input.is_prompt else "decode"
@@ -435,7 +435,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         te.finish()
 
         if model_input.is_prompt:
-            num_blocks_used = model_input.attn_metadata.prefill_metadata.block_tables.shape[1]
+            num_blocks_used = model_input.attn_metadata.prefill_metadata.block_tables.shape
             print(f"num of reused blocks: {num_blocks_used}")
 
         model_execute_time = time.perf_counter() - start_time
