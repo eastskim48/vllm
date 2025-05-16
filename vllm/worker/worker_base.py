@@ -435,8 +435,9 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         te.finish()
 
         if model_input.is_prompt:
-            num_blocks_used = model_input.attn_metadata.prefill_metadata.block_tables.shape
-            print(f"num of reused blocks: {num_blocks_used}")
+            block_table = model_input.attn_metadata.prefill_metadata.block_tables \
+                if torch.cuda.is_available() else model_input.attn_metadata.prefill_metadata.prefill_block_tables
+            print(f"num of reused blocks: {block_table.shape if block_table is not None else None}")
 
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:

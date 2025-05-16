@@ -6,21 +6,21 @@ from utils import DocumentChunk, Tokenizer, VectorDB
 
 
 class KVCacheBuilder:
-    def __init__(self, model_name: str, tokenizer: Tokenizer, cache_dir: str):
+    def __init__(self, model_name: str, tokenizer: Tokenizer, cache_dir: str,
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu"):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=None,
             device_map="auto",
         )
         self.tokenizer = tokenizer
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
         self.cache_dir = cache_dir
 
     def save_cache(self, doc: DocumentChunk, chunk_size: int):
         tokenized_input = (
             self.tokenizer.tokenize(doc.text, return_tensors=True, max_len=chunk_size).to(self.device)
         )
-        print(tokenized_input["input_ids"][0])
         with torch.no_grad():
             output = self.model(**tokenized_input, use_cache=True)  # run only prefill
 
@@ -33,11 +33,12 @@ def main(
     doc_dir: str,
     cache_dir: str,
     chunk_size: int,
-    max_samples: int
+    max_samples: int,
+    device: str
 ):
     vectordb = VectorDB(db_dir=db_dir)
     tokenizer = Tokenizer(model_name)
-    cache_manager = KVCacheBuilder(model_name, tokenizer, cache_dir)
+    cache_manager = KVCacheBuilder(model_name, tokenizer, cache_dir, device)
 
     for filename in sorted(os.listdir(doc_dir))[:max_samples]:
         doc_chunks = tokenizer.split_document(
@@ -56,9 +57,10 @@ def main(
 if __name__ == "__main__":
     main(
         model_name="meta-llama/Llama-3.2-3B",
-        db_dir="/home/s2/dongseob/preprocessing/db_3b",
-        doc_dir="/home/s2/dongseob/preprocessing/qa_data/documents",
-        cache_dir="./test_caches",
+        db_dir="/home/dongseob/preprocessing/db_3b",
+        doc_dir="/home/dongseob/preprocessing/qa_data/documents",
+        cache_dir="/home/dongseob/preprocessing/cache_3b",
         chunk_size=512,
-        max_samples=1
+        max_samples=100,
+        device="cuda"
     )

@@ -162,11 +162,13 @@ class TimeEstimator:
         )
 
     def _start(self):
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         self.start_time = time.perf_counter()
 
     def finish(self):
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end_time = time.perf_counter()
         self.elapsed_time = end_time - self.start_time
         self._write()

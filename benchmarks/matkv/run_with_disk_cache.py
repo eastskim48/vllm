@@ -9,15 +9,15 @@ from vllm import LLM, SamplingParams, RequestOutput
 from vllm.core.interfaces import BlockSpaceManager
 from vllm.sequence import SequenceGroup, Sequence
 from vllm.inputs.data import token_inputs
-from vllm.worker.worker import Worker
+# from vllm.worker.worker import Worker
 
 from utils import Tokenizer, VectorDB, TimeEstimator
 
 
 class MatKVCache:
-    def __init__(self, dir_path: str, cache_ids: List[str]):
+    def __init__(self, dir_path: str, cache_ids: List[str], device: str):
         self.layers = []
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
         self._load(dir_path, cache_ids)
 
     def _load(self, dir_path: str, cache_ids: List[str]):
@@ -51,7 +51,8 @@ class LLMManager:
         tokenizer: Tokenizer,
         use_cache: bool,
         block_size: int,
-        max_token_len: int = 1536
+        max_token_len: int = 1536,
+        device: str = "cuda"
     ):
         self.llm = LLM(
             model=model_name,
@@ -65,6 +66,7 @@ class LLMManager:
         self.block_size = block_size
         self.max_token_len = max_token_len
         self.num_blocks_allocated = 0
+        self.device = device
 
     def __del__(self):
         del self.llm
@@ -75,7 +77,7 @@ class LLMManager:
         return self.worker.kv_cache[0]
 
     @property
-    def worker(self) -> Worker:
+    def worker(self):
         return self.llm.llm_engine.model_executor.driver_worker.worker
 
     @property
@@ -120,12 +122,18 @@ class LLMManager:
             f"num_tokens must be divisible by block_size but num_tokens:{cache.num_tokens}"
 
         for layer_idx, layer_cache in enumerate(cache.layers):
+            # cpu_cache: num_blocks, self.block_size, self.num_heads, self.head_size
+            # -> (2, num_blocks, block_size(16) * num_kv_heads(8) * head_size(128))
+            # layer_cache.key = (block_size*num_blocks, num_kv_heads, head_size)
             key_cache_reshaped = layer_cache.key.view(num_blocks, self.block_size, *layer_cache.key.shape[1:])
+            value_cache_reshaped = layer_cache.value.view(num_blocks, self.block_size, *layer_cache.value.shape[1:])
+            if self.device == "cpu":
+                key_cache_reshaped = key_cache_reshaped.permute(0, 2, 1, 3).reshape(num_blocks, -1)
+                value_cache_reshaped = value_cache_reshaped.permute(0, 2, 1, 3).reshape(num_blocks, -1)
+
             self.kv_cache[layer_idx][0][
                 self.num_blocks_allocated: self.num_blocks_allocated + num_blocks
             ].copy_(key_cache_reshaped)
-
-            value_cache_reshaped = layer_cache.value.view(num_blocks, self.block_size, *layer_cache.value.shape[1:])
             self.kv_cache[layer_idx][1][
                 self.num_blocks_allocated: self.num_blocks_allocated + num_blocks
             ].copy_(value_cache_reshaped)
@@ -147,14 +155,15 @@ class MatKVLayerCache:
     value: torch.Tensor
 
 
-def analyze_logged_times(key: str, log_path: str) -> Optional[Tuple[float, float, float]]:
+def analyze_logged_times(key: str, log_path: str) -> Optional[Tuple[float, float, float, float]]:
     assert os.path.exists(log_path), f"log file not found: {log_path}"
     with open(log_path) as f:
         data = json.load(f).get(key, {})
 
-    if len(data.get("prefill", [])) != 1 or data.get("prefill", []) == []:
+    if data.get("prefill", []) == []:
         return None
-    return sum(data["prefill"]), sum(data["decode"]), len(data["decode"])
+    decode = data.get("decode", [])
+    return sum(data["prefill"]), sum(decode), len(data["prefill"]), len(decode)
 
 
 def main(
@@ -167,7 +176,8 @@ def main(
     top_k: int,
     batch_size: int,
     block_size: int,
-    max_samples: Optional[int] = None
+    max_samples: Optional[int] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ):
     # Create an LLM with prefix caching enabled.
     db = VectorDB(db_dir=db_dir)
@@ -180,6 +190,7 @@ def main(
     overall_times = []
     search_times = []
     decode_counts = []
+    prefill_counts = []
     num_errors = 0
 
     with open(query_path) as f:
@@ -194,7 +205,8 @@ def main(
 
             # run batch
             # HACK: only supports batch_size=1 for now
-            llm = LLMManager(model_name=model_name, tokenizer=tokenizer, use_cache=use_cache, block_size=block_size)
+            llm = LLMManager(model_name=model_name, tokenizer=tokenizer, use_cache=use_cache, block_size=block_size,
+                             device=device)
 
             overall_te = TimeEstimator()
             search_te = TimeEstimator()
@@ -218,7 +230,7 @@ def main(
                     llm.load_block_to_engine(doc_text)
 
                     # load caches
-                    cache = MatKVCache(cache_dir, cache_ids)
+                    cache = MatKVCache(cache_dir, cache_ids, device)
                     llm.load_external_cache(cache)
                     cache_time += cache_te.stop()
                     del cache
@@ -233,11 +245,12 @@ def main(
 
             times = analyze_logged_times(str(id(llm.worker)), log_path)
             if times is not None:
-                prefill_time, decode_time, decode_count = times
+                prefill_time, decode_time, prefill_count, decode_count = times
                 prefill_times.append(prefill_time)
             else:
                 num_errors += 1
             decode_times.append(decode_time)
+            prefill_counts.append(prefill_count)
             decode_counts.append(decode_count)
 
             del llm
@@ -253,6 +266,7 @@ def main(
     print(f"Avg decode time: {sum(decode_times) / len(decode_times)}")
     print(f"Avg generated tokens: {sum(decode_counts) / len(decode_counts)}")
     print(f"Avg decode time per step: {sum(decode_times) / sum(decode_counts)}")
+    print(f"Avg prefill time per step: {sum(prefill_times) / sum(prefill_counts)}")
     print(f"Avg overall time: {sum(overall_times) / len(overall_times)}")
     print(f"Num errors: {num_errors}")
 
@@ -261,12 +275,13 @@ if __name__ == "__main__":
     main(
         use_cache=True,
         model_name="meta-llama/Llama-3.2-3B",
-        db_dir="/home/s2/dongseob/preprocessing/db_3b",
-        cache_dir="/home/s2/dongseob/preprocessing/cache_3b",
-        query_path="/home/s2/dongseob/preprocessing/qa_data/questions/query.jsonl",
+        db_dir="/home/dongseob/preprocessing/db_3b",
+        cache_dir="/home/dongseob/preprocessing/cache_3b",
+        query_path="/home/dongseob/preprocessing/qa_data/questions/query.jsonl",
         log_path="./profile/matkv.json",
         top_k=2,
-        batch_size=8,
+        batch_size=1,
         block_size=16,
         max_samples=64,
+        device="cuda"
     )
