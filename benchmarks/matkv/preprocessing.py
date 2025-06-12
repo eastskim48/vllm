@@ -18,6 +18,8 @@ class KVCacheBuilder:
         self.cache_dir = cache_dir
 
     def save_cache(self, doc: DocumentChunk, chunk_size: int):
+        if not os.path.isdir(self.cache_dir):
+            os.makedirs(self.cache_dir)
         tokenized_input = (
             self.tokenizer.tokenize(doc.text, return_tensors=True, max_len=chunk_size).to(self.device)
         )
