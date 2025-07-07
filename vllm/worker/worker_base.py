@@ -417,9 +417,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                     and self.observability_config.collect_model_execute_time):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
-        print(f"incoming batch size: {len(model_input.query_lens)}, is_prefill: {model_input.is_prompt}")
         te = TimeEstimator(
-            name=str(id(self)),
+            name=str(id(self)) + execute_model_req.seq_group_metadata_list[0].request_id,
             key="prefill" if model_input.is_prompt else "decode"
         )
 
@@ -437,7 +436,6 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         if model_input.is_prompt:
             block_table = model_input.attn_metadata.prefill_metadata.block_tables \
                 if torch.cuda.is_available() else model_input.attn_metadata.prefill_metadata.prefill_block_tables
-            print(f"num of reused blocks: {block_table.shape if block_table is not None else None}")
 
         model_execute_time = time.perf_counter() - start_time
         if not get_pp_group().is_last_rank:

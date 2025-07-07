@@ -20,12 +20,16 @@ class KVCacheBuilder:
     def save_cache(self, doc: DocumentChunk, chunk_size: int):
         if not os.path.isdir(self.cache_dir):
             os.makedirs(self.cache_dir)
-        tokenized_input = (
-            self.tokenizer.tokenize(doc.text, return_tensors=True, max_len=chunk_size).to(self.device)
-        )
+
+        tensor_inputs = torch.tensor([doc.tokens], device="cuda")
+        tokenized_input = {
+            "input_ids": tensor_inputs,
+            "attention_mask": torch.ones_like(tensor_inputs),
+        }
         with torch.no_grad():
             output = self.model(**tokenized_input, use_cache=True)  # run only prefill
-
+        with open(f"/home/dongseob/preprocessing/tokens/{doc.chunk_id}.txt", "w") as f:
+            f.write(" ".join([str(e) for e in tokenized_input["input_ids"].tolist()[0]]))
         torch.save(output.past_key_values, os.path.join(self.cache_dir, f"{doc.chunk_id}.pt"))
 
 

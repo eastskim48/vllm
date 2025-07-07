@@ -31,9 +31,11 @@ class DocumentChunk:
     self,
     chunk_id: str,
     text: str,
+    tokens: List[int]
   ):
     self.chunk_id = chunk_id
     self.text = text
+    self.tokens = tokens
 
 
 class VectorDB:
@@ -44,7 +46,8 @@ class VectorDB:
     def add_documents(self, chunks: List[DocumentChunk]):
         self.collection.upsert(
             documents=[chunk.text for chunk in chunks],
-            ids=[chunk.chunk_id for chunk in chunks]
+            ids=[chunk.chunk_id for chunk in chunks],
+            metadatas=[{"token_len": len(chunk.tokens)} for chunk in chunks]
         )
 
     def _get_collection(self):
@@ -62,30 +65,34 @@ class VectorDB:
 class Tokenizer:
     def __init__(self, model_name: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.padding_side = "right"
+        self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({'pad_token': self.tokenizer.eos_token})
 
-    def tokenize(self, test_input: str,  return_tensors: bool = False, max_len: Optional[int] = None) -> Any:
+    def tokenize(self, test_input: str, return_tensors: bool = False, max_len: Optional[int] = None,
+                 padding: Optional[str] = "max_length", add_special_tokens=True) -> Any:
         if return_tensors:
             tokenized = self.tokenizer(
-                test_input, max_length=max_len, padding="max_length", return_tensors="pt", truncation=True
+                test_input, max_length=max_len, padding=padding, return_tensors="pt", truncation=True,
+                add_special_tokens=add_special_tokens
             )
         else:
-            tokenized = self.tokenizer(test_input, max_length=max_len, padding="max_length", truncation=True)
+            tokenized = self.tokenizer(test_input, max_length=max_len, padding=padding, truncation=True,
+                                       add_special_tokens=add_special_tokens)
         return tokenized
 
     def split_document(self, filepath: str, chunk_size: int) -> List[DocumentChunk]:
         filename = filepath.split("/")[-1]
         with open(filepath) as f:
             text = f.read()
-            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            tokens = self.tokenizer.encode(text, add_special_tokens=True)
             chunks = [
                 DocumentChunk(
                     chunk_id=f"{filename}-{i}",
                     text=self.tokenizer.decode(
                         tokens[i:i + chunk_size], skip_special_tokens=True
-                    )
+                    ),
+                    tokens=tokens[i:i + chunk_size]
                 ) for i in range(0, len(tokens), chunk_size)
             ]
         return chunks
