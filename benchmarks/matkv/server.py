@@ -1,3 +1,9 @@
+from fastapi import FastAPI, Request
+from concurrent.futures import ThreadPoolExecutor
+from pydantic import BaseModel
+from vllm import LLM, SamplingParams
+import argparse
+
 import os
 import time
 from dataclasses import dataclass
@@ -14,11 +20,11 @@ from vllm.utils import Device
 
 from utils import Tokenizer, VectorDB, TimeEstimator
 
-
 class MatKVCache:
     def __init__(self, dir_path: str, cache_ids: List[str], device: str, max_len: int):
         self.layers = []
         self.device = device
+        self.bos_cache = torch.load("./bos.pt", map_location=device, weights_only=False)
         self.max_len = max_len
         self._load(dir_path, cache_ids)
 
@@ -99,14 +105,12 @@ class LLMManager:
         assert len(self.llm.llm_engine.scheduler) == 1, "only support single scheduler (single gpu worker)"
         return self.llm.llm_engine.scheduler[0].block_manager
 
-    def generate(self, prompts: List[Any], print_outputs: bool = True) -> List[RequestOutput]:
+    def generate(self, prompts: List[Any]) -> List[Tuple[str, int]]:
         outputs = self.llm.generate(
             prompts=[TokensPrompt(prompt_token_ids=prompt) for prompt in prompts],
                                     sampling_params=self.sampling_params
         )
-        if print_outputs:
-            self._print_outputs(outputs)
-        return outputs
+        return [(output.outputs[0].text, output.num_cached_tokens) for output in outputs]
 
     def _print_outputs(self, outputs: List[RequestOutput]):
         for output in outputs:
@@ -172,161 +176,105 @@ def get_template(query: str) -> str:
     return template
 
 
-def analyze_logged_times(key: str, log_path: str) -> Optional[Tuple[float, float, float, float]]:
-    assert os.path.exists(log_path), f"log file not found: {log_path}"
-    with open(log_path) as f:
-        data = json.load(f).get(key, {})
-
-    if data.get("prefill", []) == []:
-        return None
-    decode = data.get("decode", [])
-    return sum(data["prefill"]), sum(decode), len(data["prefill"]), len(decode)
-
-
 def get_nearest_blocked_size(len: int, block_size: int) -> int:
     return ((len + (block_size - 1)) // block_size) * block_size
 
 
-def main(
-    use_cache: bool,
-    model_name: str,
-    db_dir: str,
-    cache_dir: str,
-    query_path: str,
-    log_path: str,
-    top_k: int,
-    batch_size: int,
-    block_size: int,
-    max_gpu_util: float = 0.3,
-    temperature: float = 0.3,
-    max_samples: Optional[int] = None,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-):
-    # Create an LLM with prefix caching enabled.
-    db = VectorDB(db_dir=db_dir)
-    tokenizer = Tokenizer(model_name)
 
-    prefill_times = []
-    decode_times = []
-    engine_times = []
-    load_times = []
-    overall_times = []
-    search_times = []
-    decode_counts = []
-    prefill_counts = []
-    num_errors = 0
+# server
 
-    with open(query_path) as f:
-        batch_queries = []
+class PromptRequest(BaseModel):
+    prompt: str
+    top_k: int
 
-        llm = LLMManager(model_name=model_name, tokenizer=tokenizer, use_cache=use_cache,
-                         block_size=block_size,
-                         device=device, max_gpu_util=max_gpu_util, temperature=temperature)
+llm = None
+db = None
+cache_dir = None
+bg_executor = ThreadPoolExecutor(max_workers=2)
+app: FastAPI = None
 
-        for sample_idx, line in enumerate(tqdm(f)):
-            if max_samples is not None and sample_idx >= max_samples:
-                break
-            batch_queries.append(json.loads(line)["query"])
-            if len(batch_queries) != batch_size:
-                continue
 
-            overall_te = TimeEstimator()
-            search_te = TimeEstimator()
-            results = db.batch_query(batch_queries, top_k)
-            search_times.append(search_te.stop())
+def refresh_blocktable_if_full(args):
+    global llm
+    num_free_gpu_blocks = llm.block_manager.block_allocator.get_num_free_blocks(
+        device=Device.GPU)
+    num_required_blocks = llm.max_token_len // llm.block_size
 
-            prompts = []
+    if num_free_gpu_blocks < num_required_blocks * 2:  # HACK. Needs to be optimized
+        print(f"Only {num_free_gpu_blocks} blocks left. refreshing LLM Engine...")
+        del llm
+        llm = LLMManager(model_name=args.model_name, tokenizer=Tokenizer(args.model_name), use_cache=True,
+                         block_size=args.block_size,
+                         device="cuda", max_gpu_util=args.max_gpu_util, temperature=args.temperature)
+
+
+def create_app(args):
+    global db, llm, app
+
+    db = VectorDB(db_dir=args.db_dir)
+    llm = LLMManager(model_name=args.model_name, tokenizer=Tokenizer(args.model_name), use_cache=True,
+                     block_size=args.block_size,
+                     device="cuda", max_gpu_util=args.max_gpu_util, temperature=args.temperature)
+    app = FastAPI()
+
+    @app.post("/generate")
+    def generate_text(request: PromptRequest):
+        try:
+            results = db.batch_query(request.prompt, request.top_k)
+            cache_ids = sorted(results["ids"][0])
+            doc_text = "".join(results["documents"][0])
 
             max_cache_len = get_nearest_blocked_size(
-                max(sum([m["token_len"] for m in batch_meta])
-                    for batch_meta in results["metadatas"]), block_size
+                sum([m["token_len"] for m in results["metadatas"][0]]), args.block_size
             )
 
-            if use_cache:
-                load_time = 0
-                for batch_idx, query in enumerate(batch_queries):
-                    load_te = TimeEstimator()
+            tokenized_docs = llm.tokenizer.tokenize(doc_text,
+                                                max_len=max_cache_len,
+                                                add_special_tokens=True)["input_ids"]
+            prompt = tokenized_docs + \
+                     llm.tokenizer.tokenize(get_template(request.prompt), padding="do_not_pad",
+                                        add_special_tokens=False)["input_ids"]
 
-                    cache_ids = sorted(results["ids"][batch_idx])
-                    doc_text = "".join(results["documents"][batch_idx])
+            # load caches
+            cache = MatKVCache(args.cache_dir, cache_ids, "cuda", max_len=max_cache_len)
 
-                    tokenized_docs = tokenizer.tokenize(doc_text,
-                                                        max_len=max_cache_len,
-                                                        add_special_tokens=True)["input_ids"]
-                    prompt = tokenized_docs + \
-                             tokenizer.tokenize(get_template(query), padding="do_not_pad",
-                                                add_special_tokens=False)["input_ids"]
-                    prompts.append(prompt)
+            # store caches as blocks
+            llm.load_block_to_engine(tokenized_docs)
+            llm.load_external_cache(cache)
 
-                    # load caches
-                    cache = MatKVCache(cache_dir, cache_ids, device, max_len=max_cache_len)
+            outputs = llm.generate(prompts=[prompt])
+            assert len(outputs) == 1
+            del cache
 
-                    # store caches as blocks
-                    llm.load_block_to_engine(tokenized_docs)
-                    llm.load_external_cache(cache)
+            bg_executor.submit(refresh_blocktable_if_full)
 
-                    load_time += load_te.stop()
-                    del cache
-                load_times.append(load_time)
+            return {"response": [{"prompt": request.prompt,"generated": generated, "num_cache_hit": num_cache_hit} for (generated, num_cache_hit) in outputs]}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}
 
-            # batch run
-            engine_te = TimeEstimator()
-            _ = llm.generate(prompts=prompts, print_outputs=True)
-            engine_times.append(engine_te.stop())
-
-            overall_times.append(overall_te.stop())
-
-            times = analyze_logged_times(str(id(llm.worker))+str(llm.llm.request_counter.counter-1), log_path)
-            if times is not None:
-                prefill_time, decode_time, prefill_count, decode_count = times
-                prefill_times.append(prefill_time)
-            else:
-                num_errors += 1
-            decode_times.append(decode_time)
-            prefill_counts.append(prefill_count)
-            decode_counts.append(decode_count)
-
-            batch_queries = []
-
-            # refresh llm object if block space is not enough
-            num_free_gpu_blocks = llm.block_manager.block_allocator.get_num_free_blocks(
-                device=Device.GPU)
-            num_required_blocks = llm.max_token_len // llm.block_size
-
-            if num_free_gpu_blocks < num_required_blocks * 2:  # HACK. Needs to be optimized
-                print(f"Only {num_free_gpu_blocks} blocks left. refreshing LLM Engine...")
-                del llm
-                llm = LLMManager(model_name=model_name, tokenizer=tokenizer, use_cache=use_cache,
-                                 block_size=block_size,
-                                 device=device, max_gpu_util=max_gpu_util, temperature=temperature)
+    return app
 
 
-    # print time analysis
-    print("-" * 20 + "Results" + "-" * 20)
-    print(f"Avg search time: {sum(search_times) / len(search_times)}")
-    if use_cache:
-        print(f"Avg load time: {sum(load_times) / len(load_times)}")
-    print(f"Avg engine time: {sum(engine_times) / len(engine_times)}")
-    print(f"Avg prefill time: {sum(prefill_times) / len(prefill_times)}")
-    print(f"Avg decode time: {sum(decode_times) / len(decode_times)}")
-    print(f"Avg generated tokens: {sum(decode_counts) / len(decode_counts)}")
-    print(f"Avg decode time per step: {sum(decode_times) / sum(decode_counts)}")
-    print(f"Avg prefill time per step: {sum(prefill_times) / sum(prefill_counts)}")
-    print(f"Avg overall time: {sum(overall_times) / len(overall_times)}")
-    print(f"Num errors: {num_errors}")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-3B")
+    parser.add_argument("--temperature", type=float, default=0.3)
+    parser.add_argument("--max_tokens", type=int, default=128)
+    parser.add_argument("--max_gpu_util", type=float, default=0.3)
+    parser.add_argument("--block_size", type=int, default=16)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--db_dir", type=str, default="/home/dongseob/preprocessing/db_3b")
+    parser.add_argument("--cache_dir", type=str, default="/home/dongseob/preprocessing/cache_3b")
+    args = parser.parse_args()
 
+    global app, cache_dir
+    cache_dir = args.cache_dir
+    app = create_app(args)
+
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="debug")
 
 if __name__ == "__main__":
-    main(
-        use_cache=True,
-        model_name="meta-llama/Llama-3.2-3B",
-        db_dir="/home/dongseob/preprocessing/db_3b",
-        cache_dir="/home/dongseob/preprocessing/cache_3b",
-        query_path="/home/dongseob/preprocessing/qa_data/questions/query.jsonl",
-        log_path="./profile/matkv.json",
-        top_k=1,
-        batch_size=1,
-        block_size=16,
-        max_samples=96,
-        device="cuda"
-    )
+    main()
